@@ -1,0 +1,14 @@
+diff --git a/exps/option.py b/exps/option.py
+index 6d84fbc..43b3e49 100644
+--- a/exps/option.py
++++ b/exps/option.py
+@@ -32,7 +32,8 @@ def args_parser():
+     parser.add_argument('--uniform_right', type=float, default=0.2)
+     parser.add_argument('--adcol_mu', type=float, default=0.1, help='The hyper parameter for fedprox')
+     parser.add_argument('--adcol_beta', type=float, default=0.1, help='The hyper parameter for fedprox')
+-    # others
++    parser.add_argument('--domain_keyed_proto', action='store_true', help='key the global prototype by (class, domain)')
++    parser.add_argument('--no_discriminator_fix', action='store_true', help='use the client-indexed discriminator')
+     parser.add_argument('--feat_loss_arg', type=float, default=0.1)
+     parser.add_argument('--crt_feat_num', type=int, default=50)
+     parser.add_argument('--ld', type = float, default= 1, help ='weight for fedproto mse loss')

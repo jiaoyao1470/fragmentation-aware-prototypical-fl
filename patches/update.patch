@@ -1,0 +1,252 @@
+diff --git a/exps/update.py b/exps/update.py
+index 12464d8..905cd4f 100644
+--- a/exps/update.py
++++ b/exps/update.py
+@@ -12,6 +12,42 @@ from torch.utils.data.dataset import Dataset
+ import numpy as np
+ import random
+ import pickle
++from contextlib import contextmanager, nullcontext
++
++
++@contextmanager
++def _preserve_feature_probe_state(model):
++    saved_buffers = {
++        name: buffer.detach().clone() for name, buffer in model.named_buffers()
++    }
++    python_rng_state = random.getstate()
++    numpy_rng_state = np.random.get_state()
++    torch_rng_state = torch.get_rng_state().clone()
++    cuda_rng_states = (
++        [state.clone() for state in torch.cuda.get_rng_state_all()]
++        if torch.cuda.is_available()
++        else None
++    )
++    try:
++        yield
++    finally:
++        current_buffers = dict(model.named_buffers())
++        if current_buffers.keys() != saved_buffers.keys():
++            raise RuntimeError("model buffers changed structurally during feature probe")
++        with torch.no_grad():
++            for name, saved in saved_buffers.items():
++                current = current_buffers[name]
++                if current.shape != saved.shape or current.dtype != saved.dtype:
++                    raise RuntimeError(
++                        f"model buffer {name!r} changed shape or dtype during feature probe"
++                    )
++                current.copy_(saved)
++
++        random.setstate(python_rng_state)
++        np.random.set_state(numpy_rng_state)
++        torch.set_rng_state(torch_rng_state)
++        if cuda_rng_states is not None:
++            torch.cuda.set_rng_state_all(cuda_rng_states)
+ from tqdm import tqdm
+ from torch.autograd import grad
+ 
+@@ -582,8 +618,11 @@ class LocalUpdate(object):
+         features = torch.cat(features, dim=0)
+         return copy.deepcopy(model), features
+   
+-    def update_weights_ours_debug(self, round, model, discriminator, classifier_model, train_loader, global_proto,momentum = 1):
+-        # don't change BN parameter and momentum change model classifier layer parameters
++    def update_weights_ours_debug(self, round, model, discriminator, classifier_model, train_loader, global_proto, num_domains=None, momentum = 1, global_G=None, lambda_G=0.0, feature_loader=None, preserve_feature_probe_state=False):
++        if feature_loader is None:
++            feature_loader = train_loader
++        if num_domains is None:
++            num_domains = self.args.num_users
+         model_state_dict = model.classifier.state_dict()
+         classifier_model_state_dict = classifier_model.classifier.state_dict()
+         with torch.no_grad():
+@@ -596,6 +635,7 @@ class LocalUpdate(object):
+         # Set mode to train model
+         model.train()
+         features = []
++
+         optimizer = torch.optim.SGD(model.parameters(), lr=self.args.lr)
+         # Set optimizer for the local updates
+         for step in range(self.args.wk_iters):
+@@ -607,6 +647,26 @@ class LocalUpdate(object):
+                 CE_loss = self.criterion_CE(logits, labels)
+                 if len(global_proto) == 0:
+                     loss1 = 0
++                elif self.args.domain_keyed_proto:
++                    proto_dim = next(iter(global_proto.values())).shape[0]
++                    num_classes = self.args.num_classes
++                    global_proto_matrix = torch.zeros((num_classes, proto_dim), device=self.device)
++                    present_mask = torch.zeros(num_classes, dtype=torch.bool, device=self.device)
++                    for label, proto in global_proto.items():
++                        global_proto_matrix[label] = proto
++                        present_mask[label] = True
++                    sample_valid = present_mask[labels]
++                    if sample_valid.any():
++                        rep_normalized = F.normalize(rep, dim=1)
++                        global_proto_matrix_normalized = F.normalize(global_proto_matrix, dim=1)
++                        C_y = global_proto_matrix_normalized[labels]
++                        numerator = torch.exp((rep_normalized * C_y).sum(dim=1) / self.args.T)
++                        sim = (rep_normalized @ global_proto_matrix.T) / self.args.T
++                        sim = sim.masked_fill(~present_mask.unsqueeze(0), float('-inf'))
++                        denominator = torch.exp(sim).sum(dim=1)
++                        loss1 = (-torch.log(numerator / denominator))[sample_valid].mean()
++                    else:
++                        loss1 = 0
+                 else:
+                     num_classes = len(global_proto)
+                     proto_dim = global_proto[0].shape[0]
+@@ -623,21 +683,122 @@ class LocalUpdate(object):
+                     denominator = torch.exp((rep_normalized @ global_proto_matrix.T) / self.args.T).sum(dim=1)
+                     # 损失计算
+                     loss1 = -torch.log(numerator / denominator).mean()
++
++                if global_G is None or len(global_G) == 0:
++                    loss_cross = 0
++                else:
++                    proto_dim_G = next(iter(global_G.values())).shape[0]
++                    num_classes_G = self.args.num_classes
++                    G_matrix = torch.zeros((num_classes_G, proto_dim_G), device=self.device)
++                    G_present_mask = torch.zeros(num_classes_G, dtype=torch.bool, device=self.device)
++                    for label, proto in global_G.items():
++                        G_matrix[label] = proto
++                        G_present_mask[label] = True
++                    G_sample_valid = G_present_mask[labels]
++                    if G_sample_valid.any():
++                        rep_normalized_G = F.normalize(rep, dim=1)
++                        G_matrix_normalized = F.normalize(G_matrix, dim=1)
++                        C_y_G = G_matrix_normalized[labels]
++                        numerator_G = torch.exp((rep_normalized_G * C_y_G).sum(dim=1) / self.args.T)
++                        sim_G = (rep_normalized_G @ G_matrix.T) / self.args.T
++                        sim_G = sim_G.masked_fill(~G_present_mask.unsqueeze(0), float('-inf'))
++                        denominator_G = torch.exp(sim_G).sum(dim=1)
++                        loss_cross = (-torch.log(numerator_G / denominator_G))[G_sample_valid].mean()
++                    else:
++                        loss_cross = 0
++
+                 client_index = discriminator(rep)
+                 client_index_softmax = F.log_softmax(client_index, dim=-1)
+-                target_index = torch.full(client_index.shape, 1 / self.args.num_users).to(
++                target_index = torch.full(client_index.shape, 1 / num_domains).to(
+                     self.device
+                 )
+                 target_index_softmax = F.softmax(target_index, dim=-1)
+                 kl_loss_func = nn.KLDivLoss(reduction="batchmean").to(self.device)
+-                kl_loss = kl_loss_func(client_index_softmax, target_index_softmax)           
+-                loss = CE_loss + self.args.adcol_beta * kl_loss + self.args.adcol_mu * loss1
++                kl_loss = kl_loss_func(client_index_softmax, target_index_softmax)
++                loss = CE_loss + self.args.adcol_beta * kl_loss + self.args.adcol_mu * loss1 + lambda_G * loss_cross
+                 optimizer.zero_grad()
+                 loss.backward()
+                 optimizer.step()
+-        # save features
+-        train_iter = iter(train_loader)
+         labels_ = []
++        with (_preserve_feature_probe_state(model) if preserve_feature_probe_state else nullcontext()):
++            train_iter = iter(feature_loader)
++            for batch_idx in range(len(train_iter)):
++                images, labels = next(train_iter)
++                images, labels = images.to(self.device).float(), labels.to(self.device).long()
++                rep, logits = model(images)
++                features.append(rep.detach().clone().cpu())
++                labels_.append(labels.detach().clone().cpu())
++        features = torch.cat(features, dim=0).to(self.args.device)
++
++        labels_ = torch.cat(labels_, dim=0)
++        return copy.deepcopy(model), [features, labels_]
++
++    def dpa_loss(self, f, labels, domain_label, global_protos):
++        if len(global_protos) == 0:
++            return torch.tensor(0.0, device=f.device)
++        target = f.detach().clone()
++        for i in range(labels.shape[0]):
++            key = (labels[i].item(), domain_label)
++            if key in global_protos:
++                target[i, :] = global_protos[key]
++        return 1.0 - F.cosine_similarity(F.normalize(target, dim=1), F.normalize(f, dim=1), dim=1).mean()
++
++    def cpcl_loss(self, f, labels, domain_label, global_protos, temperature=0.02):
++        if len(global_protos) == 0:
++            return torch.tensor(0.0, device=f.device)
++        other_domain_protos = {k: v for k, v in global_protos.items() if k[1] != domain_label}
++        total = 0.0
++        n_valid = 0
++        for i in range(labels.shape[0]):
++            y = labels[i].item()
++            f_now = f[i].unsqueeze(0)
++            pos = [v.unsqueeze(0) for (c, d), v in other_domain_protos.items() if c == y]
++            neg = [v.unsqueeze(0) for (c, d), v in other_domain_protos.items() if c != y]
++            if len(pos) == 0 or len(neg) == 0:
++                continue
++            f_pos = torch.cat(pos, dim=0)
++            f_neg = torch.cat(neg, dim=0)
++            f_proto = torch.cat((f_pos, f_neg), dim=0)
++            sims = F.cosine_similarity(f_now, f_proto, dim=1) / temperature
++            exp_sims = torch.exp(sims)
++            sum_pos = exp_sims[: f_pos.shape[0]].sum()
++            sum_all = exp_sims.sum()
++            total = total - torch.log(sum_pos / sum_all)
++            n_valid += 1
++        if n_valid == 0:
++            return torch.tensor(0.0, device=f.device)
++        return total / labels.shape[0]
++
++    def update_weights_feddap_inspired(self, model, classifier_model, train_loader, global_protos,
++                                        domain_label, momentum=1, lamda_1=1.0, lamda_2=1.0, infoNCET=0.02):
++        model_state_dict = model.classifier.state_dict()
++        classifier_model_state_dict = classifier_model.classifier.state_dict()
++        with torch.no_grad():
++            for key in model_state_dict:
++                if "bn" not in key:
++                    model_param = model_state_dict[key]
++                    classifier_model_param = classifier_model_state_dict[key]
++                    model_state_dict[key].copy_((1 - momentum) * model_param + momentum * classifier_model_param)
++        model.classifier.load_state_dict(model_state_dict)
++        model.train()
++        features = []
++
++        optimizer = torch.optim.SGD(model.parameters(), lr=self.args.lr)
++        for step in range(self.args.wk_iters):
++            train_iter = iter(train_loader)
++            for batch_idx in range(len(train_iter)):
++                images, labels = next(train_iter)
++                images, labels = images.to(self.device).float(), labels.to(self.device).long()
++                rep, logits = model(images)
++                CE_loss = self.criterion_CE(logits, labels)
++                dpa = self.dpa_loss(rep, labels, domain_label, global_protos)
++                cpcl = self.cpcl_loss(rep, labels, domain_label, global_protos, temperature=infoNCET)
++                loss = CE_loss + lamda_1 * dpa + lamda_2 * cpcl
++                optimizer.zero_grad()
++                loss.backward()
++                optimizer.step()
++        labels_ = []
++        train_iter = iter(train_loader)
+         for batch_idx in range(len(train_iter)):
+             images, labels = next(train_iter)
+             images, labels = images.to(self.device).float(), labels.to(self.device).long()
+@@ -645,7 +806,6 @@ class LocalUpdate(object):
+             features.append(rep.detach().clone().cpu())
+             labels_.append(labels.detach().clone().cpu())
+         features = torch.cat(features, dim=0).to(self.args.device)
+-        
+         labels_ = torch.cat(labels_, dim=0)
+         return copy.deepcopy(model), [features, labels_]
+ 
+@@ -1016,7 +1176,9 @@ class LocalTest(object):
+         acc = correct / len(test_loader.dataset)        
+         return test_loss / len(test_loader), loss_kl / len(test_loader), acc
+     
+-    def test_inference_ours(self, args, model, test_loader, dmodel):
++    def test_inference_ours(self, args, model, test_loader, dmodel, num_domains=None):
++        if num_domains is None:
++            num_domains = args.num_users
+         model.eval()
+         dmodel.eval()
+         test_loss = 0
+@@ -1028,7 +1190,7 @@ class LocalTest(object):
+             loss1 = self.criterion(logits, labels)
+             client_index = dmodel(rep)
+             client_index_softmax = F.log_softmax(client_index, dim=-1)
+-            target_index = torch.full(client_index.shape, 1 / self.args.num_users).to(
++            target_index = torch.full(client_index.shape, 1 / num_domains).to(
+                 self.device
+             )
+             target_index_softmax = F.softmax(target_index, dim=-1)

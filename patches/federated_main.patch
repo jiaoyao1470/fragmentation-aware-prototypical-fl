@@ -1,0 +1,375 @@
+diff --git a/exps/federated_main.py b/exps/federated_main.py
+index af505af..f33ba81 100644
+--- a/exps/federated_main.py
++++ b/exps/federated_main.py
+@@ -23,6 +23,14 @@ from PIL import Image
+ import concurrent.futures
+ import pickle
+ 
++
++def _validate_ours_configuration(args, feature_loader_list):
++    if feature_loader_list is not None and len(feature_loader_list) != args.num_users:
++        raise ValueError(
++            "feature_loader_list must contain exactly one loader per client: "
++            f"expected {args.num_users}, got {len(feature_loader_list)}"
++        )
++
+ def generate_random_tensor(size, p):
+     assert 0 <= p <= 1, "p should be between 0 and 1"
+     num_ones = int(size * p)
+@@ -737,25 +745,38 @@ def FedHEAL(args, train_loader_list, test_loader_list):
+             accuracy_list[datasets_name[idx]].append(copy.deepcopy(acc_temp[idx] / (args.num_users // len(datasets_name))))
+     return train_loss, accuracy_list, datasets_name
+ 
+-def ours(args, train_loader_list, test_loader_list):
++def ours(args, train_loader_list, test_loader_list, client_domains=None, acc_log_path=None, weights_dir=None, lambda_G=0.0, feature_loader_list=None, preserve_feature_probe_state=False):
++    _validate_ours_configuration(args, feature_loader_list)
+     loader_size = [len(train_loader.dataset) for train_loader in train_loader_list]
+     client_weights = [item / sum(loader_size) for item in loader_size]
+     best_local_models = []
+     if args.dataset == "digit":
+         global_model = adcol_model().to(args.device)
+         local_models = [copy.deepcopy(global_model).to(args.device) for idx in range(args.num_users)]
+-        discriminator = Discriminator(global_model, args.num_users).to(args.device)
+         datasets_name = ["MNIST", "SVHN", "USPS", "SynthDigits", "MNIST-M"]
+     elif args.dataset == "office":
+         global_model = adcol_model(num_classes=args.num_classes).to(args.device)
+         local_models = [copy.deepcopy(global_model).to(args.device) for idx in range(args.num_users)]
+-        discriminator = Discriminator(global_model, args.num_users).to(args.device)
+         datasets_name = ["amazon", "caltech", "dslr", "webcam"]
+     elif args.dataset == "PACS":
+         global_model = adcol_model(num_classes=args.num_classes).to(args.device)
+         local_models = [copy.deepcopy(global_model).to(args.device) for idx in range(args.num_users)]
+-        discriminator = Discriminator(global_model, args.num_users).to(args.device)
+         datasets_name = ["art_painting", "cartoon", "photo", "sketch"]
++
++    if client_domains is not None:
++        datasets_name = []
++        for d in client_domains:
++            if d not in datasets_name:
++                datasets_name.append(d)
++
++    domain_to_id = {d: i for i, d in enumerate(datasets_name)}
++    if args.domain_keyed_proto:
++        print(f"domain_to_id = {domain_to_id}")
++    client_domain_ids = [domain_to_id[d] for d in client_domains] if client_domains is not None else None
++
++    num_domains = args.num_users if getattr(args, "no_discriminator_fix", False) else len(datasets_name)
++    discriminator = Discriminator(global_model, num_domains).to(args.device)
++
+     global_classifier = classifier_model(args, args.num_classes).to(args.device)
+     train_loss = {item: [] for item in datasets_name}
+     accuracy_list = {item: [] for item in datasets_name}
+@@ -763,79 +784,133 @@ def ours(args, train_loader_list, test_loader_list):
+     classifier_optimizer = torch.optim.SGD(global_classifier.parameters(), lr=args.lr, weight_decay=1e-5, momentum=0.9)
+     global_proto = {}
+     best_acc = 0
+-    for round in tqdm(range(args.iters)):
++    prev_G_state = None
++    start_round = 0
++    for round in tqdm(range(start_round, args.iters)):
+         print(f'\n | Global Training Round : {round} |\n')
+         # select clients
+         features_idx = []
+         features_labels = []
+-        for idx1 in range(args.num_users // len(datasets_name)):
+-            for idx2 in range(len(datasets_name)):
+-                local_node = LocalUpdate(args=args)
+-                local_models[idx1 * len(datasets_name) + idx2], features_label= local_node.update_weights_ours_debug(round, model=copy.deepcopy(local_models[idx1 * len(datasets_name) + idx2]), discriminator=copy.deepcopy(discriminator), classifier_model=copy.deepcopy(global_classifier), train_loader=train_loader_list[idx1 * len(datasets_name) + idx2],global_proto=global_proto, momentum = args.momentum)
+-                features_labels.append([features_label[0], features_label[1]])
++        for client_idx in range(args.num_users):
++            local_node = LocalUpdate(args=args)
++            if args.domain_keyed_proto:
++                my_domain_id = client_domain_ids[client_idx]
++                client_global_proto = {
++                    cls: global_proto[(cls, my_domain_id)]
++                    for cls in range(args.num_classes)
++                    if (cls, my_domain_id) in global_proto
++                }
++            else:
++                client_global_proto = global_proto
++            client_feature_loader = None
++            if feature_loader_list is not None and feature_loader_list[client_idx] is not None:
++                client_feature_loader = feature_loader_list[client_idx]
++            local_models[client_idx], features_label = local_node.update_weights_ours_debug(round, model=copy.deepcopy(local_models[client_idx]), discriminator=copy.deepcopy(discriminator), classifier_model=copy.deepcopy(global_classifier), train_loader=train_loader_list[client_idx], global_proto=client_global_proto, momentum=args.momentum, num_domains=num_domains, global_G=(prev_G_state if args.domain_keyed_proto else None), lambda_G=float(lambda_G), feature_loader=client_feature_loader, preserve_feature_probe_state=preserve_feature_probe_state)
++            features_labels.append([features_label[0], features_label[1]])
+         local_protos = []
+         num = []
+         num_list_ = Counter()
+-        for idx1 in range(args.num_users // len(datasets_name)):
+-            for idx2 in range(len(datasets_name)):
+-                avg_proto, num_list = local_node.compute_proto_debug(train_loader=features_labels[idx1 * len(datasets_name) + idx2])
+-                local_protos.append(avg_proto)
+-                num_list_ += num_list
+-                num.append(num_list)
+-        # ratio = get_cls_ratio(args, num_list_)
+-        global_proto = get_mean(args, local_protos, num)
+-        for idx1 in range(args.num_users // len(datasets_name)):
+-            for idx2 in range(len(datasets_name)):
+-                features = features_labels[idx1 * len(datasets_name) + idx2][0]
+-                labels = features_labels[idx1 * len(datasets_name) + idx2][1]
+-                size = features.shape[1]
+-                mask = generate_random_tensor(size, p=0.9).to(args.device)
+-                lam = np.round(args.uniform_left + args.uniform_right * np.random.random(), 2)
+-                features_noise = []
++        for client_idx in range(args.num_users):
++            avg_proto, num_list = local_node.compute_proto_debug(train_loader=features_labels[client_idx])
++            local_protos.append(avg_proto)
++            num_list_ += num_list
++            num.append(num_list)
++        if args.domain_keyed_proto:
++            global_proto = get_mean_domain_keyed(args, local_protos, num, client_domain_ids)
++            prev_G_state, _ = get_cross_domain_gpcl(global_proto, prev_G=prev_G_state, beta=0.99)
++        else:
++            global_proto = get_mean(args, local_protos, num)
++
++        for client_idx in range(args.num_users):
++            features = features_labels[client_idx][0]
++            labels = features_labels[client_idx][1]
++            size = features.shape[1]
++            mask = generate_random_tensor(size, p=0.9).to(args.device)
++            lam = np.round(args.uniform_left + args.uniform_right * np.random.random(), 2)
++            features_noise = []
++            if args.domain_keyed_proto:
++                my_domain_id = client_domain_ids[client_idx]
++                for idx, label in enumerate(labels):
++                    key = (label.item(), my_domain_id)
++                    assert key in global_proto, (
++                        f"expected prototype for {key} to exist (client {client_idx} just "
++                        f"contributed a sample of this class/domain this round)"
++                    )
++                    features_noise.append(lam * features[idx] + (1 - lam) * global_proto[key])
++            else:
+                 for idx, label in enumerate(labels):
+                     features_noise.append(lam * features[idx] + (1 - lam) * global_proto[label.item()])
+-                features_noise = torch.stack(features_noise, dim=0)
+-                features_masked = features_noise * mask
+-                features_labels[idx1 * len(datasets_name) + idx2] = [features_masked, labels]
+-                ids = torch.ones(features.shape[0]) * (idx1 * len(datasets_name) + idx2)
+-                features_idx.append([features_masked, ids])
+-        loss_temp = [0 for i in range(len(datasets_name))]
+-        loss_kl = [0 for i in range(len(datasets_name))]
+-        acc_temp = [0 for i in range(len(datasets_name))]
+-        for idx1 in range(args.num_users // len(datasets_name)):
++            features_noise = torch.stack(features_noise, dim=0)
++            features_masked = features_noise * mask
++            features_labels[client_idx] = [features_masked, labels]
++            if getattr(args, "no_discriminator_fix", False):
++                ids = torch.ones(features.shape[0]) * (client_idx)
++            else:
++                domain_for_client = client_domains[client_idx] if client_domains is not None else datasets_name[client_idx]
++                ids = torch.ones(features.shape[0]) * domain_to_id[domain_for_client]
++            features_idx.append([features_masked, ids])
++
++        loss_by_domain = {d: 0.0 for d in datasets_name}
++        kl_by_domain = {d: 0.0 for d in datasets_name}
++        acc_by_domain = {d: 0.0 for d in datasets_name}
++        count_by_domain = {d: 0.0 for d in datasets_name}
++
++        for client_idx in range(args.num_users):
++            domain = client_domains[client_idx] if client_domains is not None else datasets_name[client_idx]
++            domain_pos = datasets_name.index(domain)
+             with torch.no_grad():
+-                for idx2 in range(len(datasets_name)):
+-                    local_test = LocalTest(args=args)
+-                    loss, kl_loss,  _ = local_test.test_inference_ours(args, local_models[idx1 * len(datasets_name) + idx2], train_loader_list[idx1 * len(datasets_name) + idx2], copy.deepcopy(discriminator))
+-                    loss_temp[idx2] += loss
+-                    loss_kl[idx2] += kl_loss
+-                    _, _, acc = local_test.test_inference_ours(args, local_models[idx1 * len(datasets_name) + idx2], test_loader_list[idx2], copy.deepcopy(discriminator))
+-                    acc_temp[idx2] += acc
+-        for idx in range(len(datasets_name)):
+-            print('\n{:<11s} | train loss: {:.4f} | kl loss : {:.4f}| Test Acc: {:.4f}'.format(datasets_name[idx], loss_temp[idx] / (args.num_users // len(datasets_name)), loss_kl[idx] / (args.num_users // len(datasets_name)), acc_temp[idx] / (args.num_users // len(datasets_name))))
+-            train_loss[datasets_name[idx]].append(copy.deepcopy(loss_temp[idx] / (args.num_users // len(datasets_name))))
+-            accuracy_list[datasets_name[idx]].append(copy.deepcopy(acc_temp[idx] / (args.num_users // len(datasets_name))))
+-        if sum(acc_temp) / len(acc_temp) > best_acc:
+-            for idx, dataset in enumerate(datasets_name):
+-                model_paths = f"weights/{args.seed}/{args.dataset}/"
+-                os.makedirs(model_paths, exist_ok=True)
+-                model_save_path = f"best_local_model_{dataset}.pth"
+-                torch.save(local_models[idx].state_dict(), model_paths + model_save_path)
+-            best_acc = sum(acc_temp) / len(acc_temp)
+-        # update global classifier layer
++                local_test = LocalTest(args=args)
++                loss, kl_loss, _ = local_test.test_inference_ours(args, local_models[client_idx], train_loader_list[client_idx], copy.deepcopy(discriminator), num_domains=num_domains)
++                loss_by_domain[domain] += loss
++                kl_by_domain[domain] += kl_loss
++                _, _, acc = local_test.test_inference_ours(args, local_models[client_idx], test_loader_list[domain_pos], copy.deepcopy(discriminator), num_domains=num_domains)
++                acc_by_domain[domain] += acc
++                count_by_domain[domain] += 1
++
++
++        for domain in datasets_name:
++            avg_loss = loss_by_domain[domain] / count_by_domain[domain]
++            avg_kl = kl_by_domain[domain] / count_by_domain[domain]
++            avg_acc = acc_by_domain[domain] / count_by_domain[domain]
++            print('\n{:<11s} | train loss: {:.4f} | kl loss : {:.4f}| Test Acc: {:.4f}'.format(domain, avg_loss, avg_kl, avg_acc))
++            train_loss[domain].append(copy.deepcopy(avg_loss))
++            accuracy_list[domain].append(copy.deepcopy(avg_acc))
++
++        if acc_log_path is not None:
++            os.makedirs(os.path.dirname(acc_log_path), exist_ok=True)
++            write_header = not os.path.exists(acc_log_path)
++            with open(acc_log_path, "a") as f:
++                if write_header:
++                    f.write("round,domain,train_loss,kl_loss,acc\n")
++                for domain in datasets_name:
++                    f.write(f"{round},{domain},{train_loss[domain][-1]},{kl_by_domain[domain]/count_by_domain[domain]},{accuracy_list[domain][-1]}\n")
++
++        current_avg_acc = sum(acc_by_domain[d] / count_by_domain[d] for d in datasets_name) / len(datasets_name)
++        if current_avg_acc > best_acc:
++            model_paths = weights_dir if weights_dir is not None else f"weights/{args.seed}/{args.dataset}/"
++            os.makedirs(model_paths, exist_ok=True)
++            for client_idx in range(args.num_users):
++                domain = client_domains[client_idx] if client_domains is not None else datasets_name[client_idx]
++                if client_domains is not None:
++                    model_save_path = f"best_local_model_client{client_idx}_{domain}.pth"
++                else:
++                    model_save_path = f"best_local_model_{domain}.pth"
++                torch.save(local_models[client_idx].state_dict(), model_paths + model_save_path)
++            best_acc = current_avg_acc
++
+         features_label_dataset = data_utils.FeatureDataset(features_labels)
+-        features_label_loader = torch.utils.data.DataLoader(features_label_dataset, batch_size=args.batch, shuffle=True)  
++        features_label_loader = torch.utils.data.DataLoader(features_label_dataset, batch_size=args.batch, shuffle=True)
+         loss_func = nn.CrossEntropyLoss()
+         global_classifier.train()
+         for _ in range(args.adcol_epoch):
+             for x, y in features_label_loader:
+-                x, y= x.to(args.device).float(), y.to(args.device).long()
++                x, y = x.to(args.device).float(), y.to(args.device).long()
+                 y_pred = global_classifier(x)
+                 loss1 = loss_func(y_pred, y).mean()
+                 classifier_optimizer.zero_grad()
+                 loss1.backward()
+                 classifier_optimizer.step()
+-        # update discriminator model
++
+         features_dataset = data_utils.FeatureDataset(features_idx)
+         features_loader = torch.utils.data.DataLoader(features_dataset, batch_size=args.batch, shuffle=True)  
+         discriminator.train()
+@@ -847,6 +922,7 @@ def ours(args, train_loader_list, test_loader_list):
+                 discriminator_optimizer.zero_grad()
+                 loss2.backward()
+                 discriminator_optimizer.step()
++
+     if args.exp == 4:
+         file_path = f'pkl/{args.dataset}/{args.mode}_{args.seed}_features_labels.pkl'
+         os.makedirs(os.path.dirname(file_path), exist_ok=True)
+@@ -854,6 +930,110 @@ def ours(args, train_loader_list, test_loader_list):
+             pickle.dump(features_labels, f)
+     return train_loss, accuracy_list, datasets_name
+ 
++
++def ours_feddap_inspired(args, train_loader_list, test_loader_list, client_domains,
++                          acc_log_path=None,
++                          weights_dir=None, lamda_1=1.0, lamda_2=1.0, infoNCET=0.02,
++                          attn_temperature=0.01):
++    global_model = adcol_model(num_classes=args.num_classes).to(args.device)
++    local_models = [copy.deepcopy(global_model).to(args.device) for _ in range(args.num_users)]
++    global_classifier = classifier_model(args, args.num_classes).to(args.device)
++    classifier_optimizer = torch.optim.SGD(global_classifier.parameters(), lr=args.lr, weight_decay=1e-5, momentum=0.9)
++
++    datasets_name = []
++    for d in client_domains:
++        if d not in datasets_name:
++            datasets_name.append(d)
++
++    train_loss = {item: [] for item in datasets_name}
++    accuracy_list = {item: [] for item in datasets_name}
++    global_protos = {}
++    best_acc = 0
++
++    start_round = 0
++
++    for round in tqdm(range(start_round, args.iters)):
++        print(f'\n | Global Training Round (FedDAP-inspired) : {round} |\n')
++        features_labels = []
++        local_node = None
++        for client_idx in range(args.num_users):
++            local_node = LocalUpdate(args=args)
++            domain_label = client_domains[client_idx]
++            local_models[client_idx], features_label = local_node.update_weights_feddap_inspired(
++                model=copy.deepcopy(local_models[client_idx]),
++                classifier_model=copy.deepcopy(global_classifier),
++                train_loader=train_loader_list[client_idx],
++                global_protos=global_protos,
++                domain_label=domain_label,
++                momentum=args.momentum,
++                lamda_1=lamda_1, lamda_2=lamda_2, infoNCET=infoNCET,
++            )
++            features_labels.append(features_label)
++
++        local_protos_list = {}
++        for client_idx in range(args.num_users):
++            avg_proto, _ = local_node.compute_proto_debug(train_loader=features_labels[client_idx])
++            domain_label = client_domains[client_idx]
++            local_protos_list[client_idx] = {(cls, domain_label): p for cls, p in avg_proto.items()}
++        online_clients = list(range(args.num_users))
++        global_protos = proto_aggregation_attn(local_protos_list, online_clients, temperature=attn_temperature)
++
++        features_label_dataset = data_utils.FeatureDataset(features_labels)
++        features_label_loader = torch.utils.data.DataLoader(features_label_dataset, batch_size=args.batch, shuffle=True)
++        loss_func = nn.CrossEntropyLoss()
++        global_classifier.train()
++        for _ in range(args.adcol_epoch):
++            for x, y in features_label_loader:
++                x, y = x.to(args.device).float(), y.to(args.device).long()
++                y_pred = global_classifier(x)
++                loss_gc = loss_func(y_pred, y).mean()
++                classifier_optimizer.zero_grad()
++                loss_gc.backward()
++                classifier_optimizer.step()
++
++        loss_by_domain = {d: 0.0 for d in datasets_name}
++        acc_by_domain = {d: 0.0 for d in datasets_name}
++        count_by_domain = {d: 0.0 for d in datasets_name}
++        for client_idx in range(args.num_users):
++            domain = client_domains[client_idx]
++            domain_pos = datasets_name.index(domain)
++            with torch.no_grad():
++                local_test = LocalTest(args=args)
++                loss, _ = local_test.test_inference(args, local_models[client_idx], train_loader_list[client_idx])
++                loss_by_domain[domain] += loss
++                _, acc = local_test.test_inference(args, local_models[client_idx], test_loader_list[domain_pos])
++                acc_by_domain[domain] += acc
++                count_by_domain[domain] += 1
++
++        for domain in datasets_name:
++            avg_loss = loss_by_domain[domain] / count_by_domain[domain]
++            avg_acc = acc_by_domain[domain] / count_by_domain[domain]
++            print('\n{:<11s} | train loss: {:.4f} | Test Acc: {:.4f}'.format(domain, avg_loss, avg_acc))
++            train_loss[domain].append(copy.deepcopy(avg_loss))
++            accuracy_list[domain].append(copy.deepcopy(avg_acc))
++
++        if acc_log_path is not None:
++            os.makedirs(os.path.dirname(acc_log_path), exist_ok=True)
++            write_header = not os.path.exists(acc_log_path)
++            with open(acc_log_path, "a") as f:
++                if write_header:
++                    f.write("round,domain,train_loss,kl_loss,acc\n")
++                for domain in datasets_name:
++                    f.write(f"{round},{domain},{train_loss[domain][-1]},0.0,{accuracy_list[domain][-1]}\n")
++
++        current_avg_acc = sum(acc_by_domain[d] / count_by_domain[d] for d in datasets_name) / len(datasets_name)
++        if current_avg_acc > best_acc:
++            model_paths = weights_dir if weights_dir is not None else f"weights/{args.seed}/{args.dataset}_feddap_inspired/"
++            os.makedirs(model_paths, exist_ok=True)
++            for client_idx in range(args.num_users):
++                domain = client_domains[client_idx]
++                model_save_path = f"best_local_model_client{client_idx}_{domain}.pth"
++                torch.save(local_models[client_idx].state_dict(), model_paths + model_save_path)
++            best_acc = current_avg_acc
++
++    return train_loss, accuracy_list, datasets_name
++
++
+ def ablation1(args, train_loader_list, test_loader_list):
+     # 进行不同损失函数组合，并保留原始特征-标签-客户端id三部分数据
+     loader_size = [len(train_loader.dataset) for train_loader in train_loader_list]
+@@ -1608,4 +1788,4 @@ if __name__ == "__main__":
+     
+     
+     
+-    
+\ No newline at end of file
++    
